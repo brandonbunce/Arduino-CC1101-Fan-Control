@@ -1,0 +1,149 @@
+
+# Loads default set of integrations. Do not remove.
+default_config:
+
+# Load frontend themes from the themes folder
+frontend:
+  themes: !include_dir_merge_named themes
+
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+# Example configuration.yaml entry
+mqtt:
+  - fan:
+      name: "Bedroom Fan"
+      unique_id: "arduinofan1"
+      state_topic: "home/arduinofan/1/on/state"
+      command_topic: "home/arduinofan/1/on/set"
+      direction_state_topic: "home/arduinofan/1/direction/state"
+      direction_command_topic: "home/arduinofan/1/direction/set"
+      percentage_state_topic: "home/arduinofan/1/speed/state"
+      percentage_value_template: >-
+        {% if value == '1' -%}
+        1
+        {% elif value == '2' -%}
+        2
+        {%- elif value == '3' -%}
+        3
+        {%- elif value == '4' -%}
+        4
+        {%- elif value == '5' -%}
+        5
+        {%- else -%}
+        6
+        {%- endif %}
+      percentage_command_topic: "home/arduinofan/1/speed/set"
+      percentage_command_template: >-
+        {% if value | int(default=0) == 0 -%}
+        0
+        {%- elif value | int(default=0) == 1 -%}
+        1
+        {%- elif value | int(default=0) == 2 -%}
+        2
+        {%- elif value | int(default=0) == 3 -%}
+        3
+        {%- elif value | int(default=0) == 4 -%}
+        4
+        {%- elif value | int(default=0) == 5 -%}
+        5
+        {%- else -%}
+        6
+        {%- endif %}
+      speed_range_min: 1
+      speed_range_max: 6
+  - light:
+      name: "Bedroom Fan Light"
+      state_topic: "home/arduinofan/1/light/state"
+      command_topic: "home/arduinofan/1/light/set"
+  - fan:
+      name: "Living Room Fan"
+      unique_id: "arduinofan2"
+      state_topic: "home/arduinofan/2/on/state"
+      command_topic: "home/arduinofan/2/on/set"
+      direction_state_topic: "home/arduinofan/2/direction/state"
+      direction_command_topic: "home/arduinofan/2/direction/set"
+      percentage_state_topic: "home/arduinofan/2/speed/state"
+      percentage_value_template: >-
+        {% if value == '1' -%}
+        1
+        {% elif value == '2' -%}
+        2
+        {%- elif value == '3' -%}
+        3
+        {%- elif value == '4' -%}
+        4
+        {%- elif value == '5' -%}
+        5
+        {%- else -%}
+        6
+        {%- endif %}
+      percentage_command_topic: "home/arduinofan/2/speed/set"
+      percentage_command_template: >-
+        {% if value | int(default=0) == 0 -%}
+        0
+        {%- elif value | int(default=0) == 1 -%}
+        1
+        {%- elif value | int(default=0) == 2 -%}
+        2
+        {%- elif value | int(default=0) == 3 -%}
+        3
+        {%- elif value | int(default=0) == 4 -%}
+        4
+        {%- elif value | int(default=0) == 5 -%}
+        5
+        {%- else -%}
+        6
+        {%- endif %}
+      speed_range_min: 1
+      speed_range_max: 6
+  - light:
+      name: "Living Room Fan Light"
+      state_topic: "home/arduinofan/2/light/state"
+      command_topic: "home/arduinofan/2/light/set"
+  - fan:
+      name: "Dining Room Fan"
+      unique_id: "arduinofan3"
+      state_topic: "home/arduinofan/3/on/state"
+      command_topic: "home/arduinofan/3/on/set"
+      direction_state_topic: "home/arduinofan/3/direction/state"
+      direction_command_topic: "home/arduinofan/3/direction/set"
+      percentage_state_topic: "home/arduinofan/3/speed/state"
+      percentage_value_template: >-
+        {% if value == '1' -%}
+        1
+        {% elif value == '2' -%}
+        2
+        {%- elif value == '3' -%}
+        3
+        {%- elif value == '4' -%}
+        4
+        {%- elif value == '5' -%}
+        5
+        {%- else -%}
+        6
+        {%- endif %}
+      percentage_command_topic: "home/arduinofan/3/speed/set"
+      percentage_command_template: >-
+        {% if value | int(default=0) == 0 -%}
+        0
+        {%- elif value | int(default=0) == 1 -%}
+        1
+        {%- elif value | int(default=0) == 2 -%}
+        2
+        {%- elif value | int(default=0) == 3 -%}
+        3
+        {%- elif value | int(default=0) == 4 -%}
+        4
+        {%- elif value | int(default=0) == 5 -%}
+        5
+        {%- else -%}
+        6
+        {%- endif %}
+      speed_range_min: 1
+      speed_range_max: 6
+  - light:
+      name: "Living Room Fan Light"
+      state_topic: "home/arduinofan/3/light/state"
+      command_topic: "home/arduinofan/3/light/set"
