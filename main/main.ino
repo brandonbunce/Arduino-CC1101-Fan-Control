@@ -1,22 +1,14 @@
 #include "Arduino_LED_Matrix.h"
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
-#include <RadioLib.h>
 #include <RCSwitch.h>
 #include <WiFiS3.h>
 #include <PubSubClient.h>
+#include "credentials.h"
 
-// Configure wifi settings
-#define WIFI_SSID "wifi_ssid"     // your network SSID (name)
-#define WIFI_PASS "wifi_pass"  // your network password (use for WPA, or use as key for WEP)
-
-// Configure MQTT broker settings
-#define MQTT_HOST "X.X.X.X"
-#define MQTT_PORT 1883
-#define MQTT_USER "mqtt_user"
-#define MQTT_PASS "mqtt_pass"
 #define MQTT_CLIENT_NAME "arduinofan"
 #define BASE_TOPIC "home/arduinofan"
 
+// Define MQTT topics
 #define STATUS_TOPIC BASE_TOPIC "/status"
 #define SUBSCRIBE_TOPIC_ON_SET BASE_TOPIC "/+/on/set"
 #define SUBSCRIBE_TOPIC_ON_STATE BASE_TOPIC "/+/on/state"
@@ -27,32 +19,36 @@
 #define SUBSCRIBE_TOPIC_DIRECTION_SET BASE_TOPIC "/+/direction/set"
 #define SUBSCRIBE_TOPIC_DIRECTION_STATE BASE_TOPIC "/+/direction/state"
 
+// Define CC1101 settings
+#define CC1101_RX_FREQUENCY 303.85  //mhz
+#define CC1101_TX_FREQUENCY 303.85  //mhz
+
 #pragma region LED_Matrix
 
 // Made using https://ledmatrix-editor.arduino.cc/
 
 unsigned long ledTransmit[] = {
-		0x30c26426,
-		0x430c0600,
-		0x60060060
+  0x30c26426,
+  0x430c0600,
+  0x60060060
 };
 
 unsigned long ledReceive[] = {
-		0x30c16816,
-		0x830c0600,
-		0x60060060
+  0x30c16816,
+  0x830c0600,
+  0x60060060
 };
 
 unsigned long ledIdle[] = {
-		0x6006,
-		0x600,
-		0x60060060
+  0x6006,
+  0x600,
+  0x60060060
 };
 
 unsigned long ledError[] = {
-		0x19811,
-		0x1f82,
-		0x4204000,
+  0x19811,
+  0x1f82,
+  0x4204000,
 };
 
 #pragma endregion
@@ -63,21 +59,21 @@ PubSubClient client(wifiClient);
 RCSwitch mySwitch = RCSwitch();
 ArduinoLEDMatrix matrix;
 
-int status = WL_IDLE_STATUS;
-String serialCommand;
-float frequency = 303.85;
-int selectedFan;
+// Instantiate variables
+int wifiStatus = WL_IDLE_STATUS;
 
+// Define fan structure.
 struct fan {
   const char* fanIdentifier;  // This is the fan's 16-bit identifier (ex. 0111110111100011)
   bool lightState;            // Is the light on or off?
   bool fanState;              // Is the fan rotating?
   bool fanDirection;          // Is the fan blowing forward/down (true) or reverse/up (false)?
   uint8_t fanSpeed;           // What speed is the fan? (1-6)
+  bool stateIsKnown;          // Does the controller know the state of this fan? (ex. did the fan state change while the controller lost power?)
 };
 
-const char* fanCommand[9] = {
-  "10100000",  // Light
+const char* fanCommand[10] = {
+  "10100000",  // Toggle Light
   "11000000",  // Speed 1
   "10011000",  // Speed 2
   "01000000",  // Speed 3
@@ -85,11 +81,12 @@ const char* fanCommand[9] = {
   "10010100",  // Speed 5
   "10000000",  // Speed 6
   "00100000",  // Stop
-  "11010000"   // Reverse
+  "11010000",  // Reverse
+  "11110000"   // Reset (Speed 0, Blowing Down, Light Off and Max Brightness)
 };
 
-fan fans[3] = { { "0111110111100011", false, false, true, 3 }, { "1100100111101111", false, false, true, 3 }, { "0100101111101101", false, false, true, 3 } };
-// We are initializing 3 elements, with the 1st element being 0-indexed.
+fan fans[3] = { { "0111110111100011", false, false, true, 3, false }, { "1100100111101111", false, false, true, 3, false }, { "0100101111101101", false, false, true, 3, false } };
+// We are initializing 3 elements. But remember, we address these 0-2.
 
 // CC1101 to Arduino UNO R4 WiFi Map
 // GND - GND
@@ -103,17 +100,18 @@ fan fans[3] = { { "0111110111100011", false, false, true, 3 }, { "11001001111011
 
 void setup() {
   Serial.begin(9600);
-  intializeDisplay();
+  initializeDisplay();
   initializeRadio();
-  // We will set radio to receive initially.
-  setRadioMode(false);
   initializeNetwork();
+  initializeMQTT();
 }
 
 void loop() {
 
-  // Here, we handle serial commands used for debugging.
+  // Handle incoming Serial commands.
   if (Serial.available()) {
+    String serialCommand;
+    int selectedFan;
     serialCommand = Serial.readStringUntil('\n');
     serialCommand.toLowerCase();
     serialCommand.trim();
@@ -138,29 +136,50 @@ void loop() {
       }
       Serial.print("Selected fan speed: ");
       Serial.println(String(argument1));
-      sendRadioCommand(selectedFan, argument1);
+      sendRadioCommand(assembleRadioCommand(selectedFan, argument1));
+      updateFanState(selectedFan, argument1);
 
     } else if (serialCommand.equals("light")) {
       Serial.println("Toggling light on fan.");
-      sendRadioCommand(selectedFan, 0);
+      sendRadioCommand(assembleRadioCommand(selectedFan, 0));
+      updateFanState(selectedFan, 0);
     } else if (serialCommand.equals("stop")) {
       Serial.println("Stopping fan.");
-      sendRadioCommand(selectedFan, 7);
+      sendRadioCommand(assembleRadioCommand(selectedFan, 7));
+      updateFanState(selectedFan, 7);
     } else if (serialCommand.equals("reverse")) {
       Serial.println("Reversing fan.");
-      sendRadioCommand(selectedFan, 8);
+      sendRadioCommand(assembleRadioCommand(selectedFan, 8));
+      updateFanState(selectedFan, 8);
     } else if (serialCommand.equals("sendbinary")) {
       // This will only send 24bit codes (+1 is terminator)
       char argument1[25];
-      Serial.println((strlen(argument1)));
       while ((strlen(argument1)) == 0) {
         // This will only send 24bit codes (+1 is terminator)
         Serial.readStringUntil('\n').toCharArray(argument1, 25);
-        ;
       }
-      Serial.print("Sending binary code: ");
+      sendRadioCommand(argument1);
+    } else if (serialCommand.equals("sendint")) {
+
+      int argument1;
+      Serial.println("Please enter int:");
+      while (!argument1) {
+        argument1 = Serial.readStringUntil('\n').toInt();
+      }
       Serial.println(argument1);
-      mySwitch.send(argument1);
+
+      static char radioCommand[25];                          // 24 bits + null terminator
+      strcpy(radioCommand, fans[0].fanIdentifier);           // Copy the identifier to radioCommand
+      strcat(radioCommand, dec2binWzerofill(argument1, 8));  // Concatenate the light command
+
+      // Transmit command over radio.
+      Serial.print("TX: ");
+      matrix.loadFrame(ledTransmit);
+      setRadioMode(true);
+      delay(100);  // Maybe remove this? Added as precaution to prevent dropped commands in case radio takes time to switch over.
+      mySwitch.send(radioCommand);
+      setRadioMode(false);
+      matrix.loadFrame(ledIdle);
     } else if (serialCommand.equals("mqtton")) {
       client.publish("home/arduinofan/1/speed/state", "4", true);
       client.publish("home/arduinofan/1/on/state", "ON", true);
@@ -185,7 +204,7 @@ void loop() {
     }
   }
 
-  // Check if there are any incoming commands from CC1101.
+  // Handle incoming commands from radio.
   if (mySwitch.available()) {
     matrix.loadFrame(ledReceive);
     char* binary = dec2binWzerofill(mySwitch.getReceivedValue(), 24);
@@ -196,22 +215,23 @@ void loop() {
     matrix.loadFrame(ledIdle);
   }
 
-  // Check if we are (or were ever) still connected to MQTT
+  // Check if we are still (or were ever) connected to MQTT
   if (!client.connected()) {
-    reconnect();
+    initializeMQTT();
   }
 
   // Check for any incoming commands from MQTT
   client.loop();
 }
 
-// Set up radio for transmission. Receive/transmit doesn't matter here because
-// these parameters will remain constant throughtout operation.
+// Set up radio for transmission.
 void initializeRadio() {
+  while (!ELECHOUSE_cc1101.getCC1101()) {
+    Serial.println("CC1101: SPI communication failure! Please check connections and try again. Trying again in 5 seconds.");
+    delay(5000);
+  }
   // Driver initializes radio thru SPI.
   ELECHOUSE_cc1101.Init();
-  // Driver sets radio frequency thru SPI.
-  ELECHOUSE_cc1101.setMHZ(frequency);
   // Driver sets radio to ASK/OOK mode.
   ELECHOUSE_cc1101.setModulation(2);
   // Set protocol.
@@ -221,6 +241,9 @@ void initializeRadio() {
   mySwitch.setRepeatTransmit(15);
   // Set pulse length to 290 microseconds.
   mySwitch.setPulseLength(290);
+  // Set radio to receive.
+  setRadioMode(false);
+  // Done!
 }
 
 void initializeNetwork() {
@@ -238,31 +261,29 @@ void initializeNetwork() {
   }
 
   // attempt to connect to WiFi network:
-  while (status != WL_CONNECTED) {
+  while (wifiStatus != WL_CONNECTED) {
     matrix.loadFrame(ledIdle);
     Serial.print("Attempting to connect to SSID: ");
     Serial.println(WIFI_SSID);  // print the network name (SSID);
 
     // Connect to WPA/WPA2 network. Change this line if using open or WEP network:
-    status = WiFi.begin(WIFI_SSID, WIFI_PASS);
+    wifiStatus = WiFi.begin(WIFI_SSID, WIFI_PASS);
     // wait 10 seconds for connection:
     delay(10000);
   }
   printWifiStatus();  // you're connected now, so print out the status
-
-  // Now we can start MQTT broker connection
-  client.setServer(MQTT_HOST, MQTT_PORT);
-  client.setCallback(mqttCallback);
 }
 
-void intializeDisplay() {
+void initializeDisplay() {
   matrix.begin();
-    matrix.loadFrame(ledIdle);
+  matrix.loadFrame(ledIdle);
 }
 
 void setRadioMode(bool enableTransmit) {
   // We are transmitting.
   if (enableTransmit) {
+    // Driver sets radio frequency thru SPI.
+    ELECHOUSE_cc1101.setMHZ(CC1101_TX_FREQUENCY);
     // Set hardware to transmit thru SPI.
     ELECHOUSE_cc1101.SetTx();
     // Set library to transmit.
@@ -271,6 +292,8 @@ void setRadioMode(bool enableTransmit) {
   }
   // We are listening.
   else {
+    // Driver sets radio frequency thru SPI.
+    ELECHOUSE_cc1101.setMHZ(CC1101_RX_FREQUENCY);
     // Set hardware to receive thru SPI.
     ELECHOUSE_cc1101.SetRx();
     // Set library to receive.
@@ -279,31 +302,32 @@ void setRadioMode(bool enableTransmit) {
   }
 }
 
-void reconnect() {
+void initializeMQTT() {
   // Loop until we're reconnected
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    // Attempt to connect
-    if (client.connect(MQTT_CLIENT_NAME, MQTT_USER, MQTT_PASS, STATUS_TOPIC, 0, true, "offline")) {
-      Serial.println("connected!");
-      // Once connected, publish an announcement...
-      client.publish(STATUS_TOPIC, "online", true);
-      // ... and resubscribe
-      client.subscribe(SUBSCRIBE_TOPIC_ON_SET);
-      client.subscribe(SUBSCRIBE_TOPIC_ON_STATE);
-      client.subscribe(SUBSCRIBE_TOPIC_SPEED_SET);
-      client.subscribe(SUBSCRIBE_TOPIC_SPEED_STATE);
-      client.subscribe(SUBSCRIBE_TOPIC_LIGHT_SET);
-      client.subscribe(SUBSCRIBE_TOPIC_LIGHT_STATE);
-      client.subscribe(SUBSCRIBE_TOPIC_DIRECTION_STATE);
-      client.subscribe(SUBSCRIBE_TOPIC_DIRECTION_SET);
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
-    }
+  // Now we can start MQTT broker connection
+  client.setServer(MQTT_HOST, MQTT_PORT);
+  client.setCallback(mqttCallback);
+  Serial.print("MQTT: Attempting connection...");
+  // Attempt to connect
+  if (client.connect(MQTT_CLIENT_NAME, MQTT_USER, MQTT_PASS, STATUS_TOPIC, 0, true, "offline")) {
+    Serial.println("MQTT: Connection established to broker.");
+    // Once connected, publish an announcement...
+    client.publish(STATUS_TOPIC, "online", true);
+    // ... and resubscribe
+    client.subscribe(SUBSCRIBE_TOPIC_ON_SET);
+    client.subscribe(SUBSCRIBE_TOPIC_ON_STATE);
+    client.subscribe(SUBSCRIBE_TOPIC_SPEED_SET);
+    client.subscribe(SUBSCRIBE_TOPIC_SPEED_STATE);
+    client.subscribe(SUBSCRIBE_TOPIC_LIGHT_SET);
+    client.subscribe(SUBSCRIBE_TOPIC_LIGHT_STATE);
+    client.subscribe(SUBSCRIBE_TOPIC_DIRECTION_STATE);
+    client.subscribe(SUBSCRIBE_TOPIC_DIRECTION_SET);
+  } else {
+    Serial.print("failed, rc=");
+    Serial.print(client.state());
+    Serial.println(" try again in 5 seconds");
+    // Wait 5 seconds before retrying
+    delay(5000);
   }
 }
 
@@ -362,7 +386,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   // Get ID after the base topic + a slash
   char id[2];
-  memcpy(id, &topic[strlen(BASE_TOPIC) + 1], 1); // strlen(BASE_TOPIC) + 1 to skip the slash
+  memcpy(id, &topic[strlen(BASE_TOPIC) + 1], 1);  // strlen(BASE_TOPIC) + 1 to skip the slash
   id[1] = '\0';
 
   uint8_t idint = strtol(id, (char**)NULL, 10);  // Use base 10 instead of base 2
@@ -378,60 +402,67 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   if (strcmp(action, "set") == 0) {
     if (strcmp(attr, "on") == 0) {
-      if (strcmp(payloadChar, "on") == 0) 
-      {
+      if (strcmp(payloadChar, "on") == 0) {
         // Send last recorded speed to the fan.
-        sendRadioCommand(idint, fans[idint-1].fanSpeed);
-      } 
-      else if (strcmp(payloadChar, "off") == 0) 
-      {
+        sendRadioCommand(assembleRadioCommand(idint, fans[idint - 1].fanSpeed));
+        updateFanState(idint, fans[idint - 1].fanSpeed);
+      } else if (strcmp(payloadChar, "off") == 0) {
         // Send stop command to fan.
-        sendRadioCommand(idint, 7);
+        sendRadioCommand(assembleRadioCommand(idint, 7));
+        updateFanState(idint, 7);
       }
     }
     if (strcmp(attr, "speed") == 0) {
       if (strcmp(payloadChar, "0") == 0) {
         // In the percentage slider, this looks like off, so we treat it as off.
-        sendRadioCommand(idint, 7);
+        sendRadioCommand(assembleRadioCommand(idint, 7));
+        updateFanState(idint, 7);
       } else if (strcmp(payloadChar, "1") == 0) {
-        sendRadioCommand(idint, 1);
+        sendRadioCommand(assembleRadioCommand(idint, 1));
+        updateFanState(idint, 1);
       } else if (strcmp(payloadChar, "2") == 0) {
-        sendRadioCommand(idint, 2);
+        sendRadioCommand(assembleRadioCommand(idint, 2));
+        updateFanState(idint, 2);
       } else if (strcmp(payloadChar, "3") == 0) {
-        sendRadioCommand(idint, 3);
+        sendRadioCommand(assembleRadioCommand(idint, 3));
+        updateFanState(idint, 3);
       } else if (strcmp(payloadChar, "4") == 0) {
-        sendRadioCommand(idint, 4);
+        sendRadioCommand(assembleRadioCommand(idint, 4));
+        updateFanState(idint, 4);
       } else if (strcmp(payloadChar, "5") == 0) {
-        sendRadioCommand(idint, 5);
+        sendRadioCommand(assembleRadioCommand(idint, 5));
+        updateFanState(idint, 5);
       } else if (strcmp(payloadChar, "6") == 0) {
-        sendRadioCommand(idint, 6);
+        sendRadioCommand(assembleRadioCommand(idint, 6));
+        updateFanState(idint, 6);
       }
     } else if (strcmp(attr, "light") == 0) {
       if (strcmp(payloadChar, "on") == 0) {
         // Only send on command if light is off.
-        if (!fans[idint-1].lightState) {
-          sendRadioCommand(idint, 0);
+        if (!fans[idint - 1].lightState) {
+          sendRadioCommand(assembleRadioCommand(idint, 0));
+          updateFanState(idint, 0);
         }
       } else if (strcmp(payloadChar, "off") == 0) {
         // Only send off command if light is on.
-        if (fans[idint-1].lightState) {
-            sendRadioCommand(idint, 0);
+        if (fans[idint - 1].lightState) {
+          sendRadioCommand(assembleRadioCommand(idint, 0));
+          updateFanState(idint, 0);
         }
       }
-    }
-    else if (strcmp(attr, "direction") == 0) {
+    } else if (strcmp(attr, "direction") == 0) {
       if (strcmp(payloadChar, "forward") == 0) {
         // Only send flip fan command if backwards.
-        if (!fans[idint-1].fanDirection) {
-          sendRadioCommand(idint, 8);
+        if (!fans[idint - 1].fanDirection) {
+          sendRadioCommand(assembleRadioCommand(idint, 8));
+          updateFanState(idint, 8);
         }
-      }
-      else if (strcmp(payloadChar, "reverse") == 0) {
+      } else if (strcmp(payloadChar, "reverse") == 0) {
         // Only send flip fan command if forwards.
-        if (fans[idint-1].fanDirection) {
-          sendRadioCommand(idint, 8);
+        if (fans[idint - 1].fanDirection) {
+          sendRadioCommand(assembleRadioCommand(idint, 8));
+          updateFanState(idint, 8);
         }
-
       }
     }
   }
@@ -441,37 +472,37 @@ void publishMQTTState(int fan) {
   char outTopic[100];
   char fanIDStr[2];
   char fanSpeedStr[4];
-  itoa(fan, fanIDStr, 10);  // Convert fan (integer) to a character array (base 10)
+  itoa(fan, fanIDStr, 10);                        // Convert fan (integer) to a character array (base 10)
   itoa(fans[fan - 1].fanSpeed, fanSpeedStr, 10);  // Convert fanSpeed (uint8_t) to a character array (base 10)
   sprintf(outTopic, "%s/%s/on/state", BASE_TOPIC, fanIDStr);
-  client.publish(outTopic, fans[fan-1].fanState ? "ON":"OFF", true);
+  client.publish(outTopic, fans[fan - 1].fanState ? "ON" : "OFF", true);
   sprintf(outTopic, "%s/%s/speed/state", BASE_TOPIC, fanIDStr);
   client.publish(outTopic, fanSpeedStr, true);
   sprintf(outTopic, "%s/%s/light/state", BASE_TOPIC, fanIDStr);
-  client.publish(outTopic, fans[fan-1].lightState ? "ON":"OFF", true);
+  client.publish(outTopic, fans[fan - 1].lightState ? "ON" : "OFF", true);
   sprintf(outTopic, "%s/%s/direction/state", BASE_TOPIC, fanIDStr);
-  client.publish(outTopic, fans[fan-1].fanDirection ? "forward":"reverse", true);
+  client.publish(outTopic, fans[fan - 1].fanDirection ? "forward" : "reverse", true);
 }
 
 void updateFanState(int fan, int command) {
   switch (command) {
-    case 0:
+    case 0:  // Toggle light
       {
         fans[fan - 1].lightState = !fans[fan - 1].lightState;
         break;
       }
-    case 1 ... 6:
+    case 1 ... 6:  // Set speed
       {
         fans[fan - 1].fanState = true;
         fans[fan - 1].fanSpeed = command;
         break;
       }
-    case 7:
+    case 7:  // Stop
       {
         fans[fan - 1].fanState = false;
         break;
       }
-    case 8:
+    case 8:  // Toggle direction
       {
         fans[fan - 1].fanDirection = !fans[fan - 1].fanDirection;
         break;
@@ -486,23 +517,36 @@ void updateFanState(int fan, int command) {
   publishMQTTState(fan);
 }
 
-void sendRadioCommand(int fan, int command) {
+void syncFan(int fan) {  // Not implemented
+  // Send special command 11110000,
+  // then, tell fan to be in the state we think it is.
+  // Send reset command
+  sendRadioCommand(assembleRadioCommand(fan, 9));
+  delay(500);
+  // Send speed
+  sendRadioCommand(assembleRadioCommand(fan, fans[fan - 1].fanSpeed));
+  delay(500);
+  // If light is supposed to be on, turn it on.
+  if (fans[fan - 1].lightState) {
+    sendRadioCommand(assembleRadioCommand(fan, 0));
+  }
+}
+
+char* assembleRadioCommand(int fan, int command) {
   //Serial.print("Called assembleCommand fan:");
   //Serial.println(fan);
   //Serial.print("Called assembleCommand command:");
   //Serial.println(command);
 
-  if ((fan < 1 || fan > 3) || (command < 0 || command > 8)) 
-  {
-    Serial.println("Cannot execute sendRadioCommand().");
+  if ((fan < 1 || fan > 3) || (command < 0 || command > 9)) {
+    Serial.println("ERROR: Failed to assemble radio command.");
     Serial.print("Fan ");
     Serial.print(String(fan));
     Serial.print(" and command ");
     Serial.print(String(command));
     Serial.println(" are not valid parameters.");
-  } 
-  else 
-  {
+    return NULL;  // Command failed, will not send.
+  } else {
     char* identifier = NULL;
     char* commandByte = NULL;
     static char radioCommand[25];  // 24 bits + null terminator
@@ -515,21 +559,31 @@ void sendRadioCommand(int fan, int command) {
 
     strcpy(radioCommand, identifier);   // Copy the identifier to radioCommand
     strcat(radioCommand, commandByte);  // Concatenate the light command
-    radioCommand[24] = '\0'; // Null terminate
-
-    // Transmit command over radio.
-    Serial.print("TX: ");
-    Serial.println(radioCommand);
-    matrix.loadFrame(ledTransmit);
-    setRadioMode(true);
-    delay(100);  // Maybe remove this? Added as precaution to prevent dropped commands in case radio takes time to switch over.
-    mySwitch.send(radioCommand);
-    setRadioMode(false);
-    matrix.loadFrame(ledIdle);
-
-    // Update fan state to reflect what we just did.
-    updateFanState(fan, command);
+    radioCommand[24] = '\0';            // Null terminate
+    return radioCommand;
   }
+}
+
+void sendRadioCommand(char* radioCommand) {
+  if (!radioCommand) {
+    Serial.println("ERROR: Tried to send radio command with NULL value. Returning.");
+    return;
+  }
+  // Transmit command over radio.
+  Serial.print("TX: ");
+  Serial.println(radioCommand);
+  matrix.loadFrame(ledTransmit);
+  setRadioMode(true);
+  //delay(100);  // Maybe remove this? Added as precaution to prevent dropped commands in case radio takes time to switch over.
+  mySwitch.send(radioCommand);
+  setRadioMode(false);
+  matrix.loadFrame(ledIdle);
+
+
+  // Update fan state to reflect what we just did.
+  //if (updateState) {
+  //  updateFanState(fan, command);
+  //}
 }
 
 void printFanStatus(int fan) {
@@ -550,7 +604,9 @@ void printFanStatus(int fan) {
   } else {
     Serial.println("Up");
   }
-    Serial.println("--------------------");
+  Serial.print("State Sync: ");
+  Serial.println(fans[fan - 1].stateIsKnown);
+  Serial.println("--------------------");
 }
 
 void printWifiStatus() {
